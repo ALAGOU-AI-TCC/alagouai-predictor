@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+numpy>=1.23,<2.1
+pandas>=2.0,<2.3
+scikit-learn>=1.2,<1.6
+xgboost>=1.7,<2.1
+pydantic>=2
