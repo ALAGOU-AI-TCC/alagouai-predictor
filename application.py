@@ -1,42 +1,132 @@
+# application.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
-import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Optional
 import os
+
+import pandas as pd
+import numpy as np
 from joblib import load as joblib_load
+
 import warnings
 from sklearn.exceptions import InconsistentVersionWarning
-from decimal import Decimal, ROUND_HALF_UP
 
-# (opcional) esconder o warning de versão, enquanto você não alinha o scikit-learn/xgboost
+# HTTP p/ Google Elevation
+import requests
+
+# Raster (declive)
+import rasterio
+from rasterio.warp import transform as rio_transform
+
+# =======================
+# Config / Paths
+# =======================
 warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
-MODELS_DIR = os.getenv("MODELS_DIR", "models")
-MODEL_PATH = os.path.join(MODELS_DIR, "modelo_xgboost.pkl")  # seu arquivo .pkl
+MODELS_DIR = "models"
+MODEL_PATH = os.path.join(MODELS_DIR, "modelo_xgboost.pkl")
 
-app = FastAPI(title="Flood Risk Inference API", version="1.0.0")
+# GeoTIFF de declive em graus; idealmente EPSG:4326
+SLOPE_TIF = os.getenv("SLOPE_TIF", "data/slope_srtm_sp.tif")
+
+# Chave da Google Elevation API (defina no ambiente!)
+GOOGLE_MAPS_KEY = "AIzaSyBpRcVv-m-kQAgoCRlT1HVqNCC1QM0eY1c"
+
+#os.getenv("GOOGLE_MAPS_KEY")
+
+# Bins iguais aos usados no treino
+DECLIVE_BINS  = [0, 2, 4, 6, 8, 10, 15, 60]
+DECLIVE_LABEL = [f"{DECLIVE_BINS[i]}–{DECLIVE_BINS[i+1]}°" for i in range(len(DECLIVE_BINS)-1)]
+
+# =======================
+# App
+# =======================
+app = FastAPI(title="AlagouAI Predictor", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- carrega e garante que é um modelo válido ---
+# =======================
+# Carregamentos
+# =======================
 xgb_pipeline = joblib_load(MODEL_PATH)
 if not hasattr(xgb_pipeline, "predict_proba"):
-    raise RuntimeError(f"{MODEL_PATH} não parece um Pipeline com predict_proba.")
+    raise RuntimeError("modelo_xgboost.pkl não é um Pipeline com predict_proba.")
 
-# Nomes EXATOS usados no treino (ajuste se necessário)
-MODEL_FEATURES = [
-    "temperatura", "umidade", "pressao",
-    "precipitacao_chuva", "ponto_orvalho",
-    "tempo_chuva", "precipitacao_acumulada",
-    "intensidade_chuva"
-]
+slope_ds = rasterio.open(SLOPE_TIF)  # mantém o raster aberto
 
-# Input aceita camelCase no JSON e mapeia para snake_case internamente
+# =======================
+# Helpers
+# =======================
+def round2(v: float) -> float:
+    return float(Decimal(v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+def fmt_ptbr_2dec(v: float) -> str:
+    return f"{round2(v):.2f}".replace(".", ",")
+
+def bucketize(p: float) -> str:
+    if p <= 0.30: return "baixo"
+    if p <= 0.70: return "medio"
+    return "alto"
+
+def sample_raster(ds: rasterio.DatasetReader, lon: float, lat: float) -> Optional[float]:
+    """Amostra valor do raster em lon/lat, independente do CRS do raster."""
+    try:
+        if ds.crs and ds.crs.to_epsg() != 4326:
+            x, y = rio_transform("EPSG:4326", ds.crs, [lon], [lat])
+            x, y = x[0], y[0]
+        else:
+            x, y = lon, lat
+        row, col = ds.index(x, y)
+        if row < 0 or col < 0 or row >= ds.height or col >= ds.width:
+            return None
+        val = ds.read(1)[row, col]
+        if ds.nodata is not None and (val == ds.nodata):
+            return None
+        if np.isnan(val):
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+def get_google_elevation(lat: float, lon: float, timeout: float = 3.5) -> Optional[float]:
+    """
+    Consulta a Google Elevation API e retorna a elevação em metros.
+    Retorna None em qualquer falha (HTTP, quota, sem resultados, chave ausente etc.).
+    """
+    if not GOOGLE_MAPS_KEY:
+        return None
+    try:
+        url = "https://maps.googleapis.com/maps/api/elevation/json"
+        params = {"locations": f"{lat},{lon}", "key": GOOGLE_MAPS_KEY}
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if data.get("status") != "OK":
+            return None
+        results = data.get("results", [])
+        if not results:
+            return None
+        elev_m = results[0].get("elevation")
+        if elev_m is None:
+            return None
+        return float(elev_m)
+    except Exception:
+        return None
+
+# =======================
+# Schemas
+# =======================
 class Input(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
+
+    latitude:  float = Field(..., alias="latitude")
+    longitude: float = Field(..., alias="longitude")
 
     temperatura: float = Field(..., alias="temperatura")
     umidade: float = Field(..., alias="umidade")
@@ -46,67 +136,89 @@ class Input(BaseModel):
     ponto_orvalho: float = Field(..., alias="pontoOrvalho")
     tempo_chuva: int = Field(..., alias="tempoChuva")
     precipitacao_acumulada: float = Field(..., alias="precipitacaoAcumulada")
-    intensidade_chuva: str = Field(..., alias="intensidadeChuva")  # OHE no pipeline
+    intensidade_chuva: str = Field(..., alias="intensidadeChuva")
 
 class PredictResponse(BaseModel):
-    risk: float      # 0..1 (duas casas)
-    chance: str      # "pt-BR" com duas casas e '%', ex.: "40,20%"
-    bucket: str
+    risk: float      # 0..1 (2 casas)
+    chance: str      # "40,20%"
+    bucket: str      # baixo/medio/alto
     model: str
+    meta: dict
 
-def bucketize(p: float) -> str:
-    if p <= 0.30: return "baixo"
-    if p <= 0.70: return "medio"
-    return "alto"
-
-def round2(v: float) -> float:
-    # arredondamento estável half-up
-    return float(Decimal(v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-
-def fmt_ptbr_2dec(v: float) -> str:
-    # retorna string com vírgula e 2 casas, ex.: "40,20"
-    s = f"{round2(v):.2f}"
-    return s.replace(".", ",")
-
+# =======================
+# Endpoints
+# =======================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(inp: Input):
-    # 1) Pega dados internos (snake_case)
-    payload = inp.model_dump(by_alias=False)
+    p = inp.model_dump(by_alias=False)
 
-    # 2) DataFrame com nomes internos
-    df_internal = pd.DataFrame([payload])
+    # 1) Declive (graus) via raster
+    declive_graus = sample_raster(slope_ds, p["longitude"], p["latitude"])
+    if declive_graus is None:
+        raise HTTPException(status_code=422, detail="Declive não encontrado para essa coordenada.")
 
-    # 3) Valida features exigidas pelo modelo
-    missing = [c for c in MODEL_FEATURES if c not in df_internal.columns]
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail={"error": "Campos ausentes para o modelo", "missing_features": missing}
-        )
+    # 1.1) Elevação via Google (metros) — fallback p/ 0.0 se falhar
+    elev = get_google_elevation(p["latitude"], p["longitude"])
+    elev_ok = elev is not None
+    solo_elevacao = elev if elev_ok else 0.0
 
-    # 4) Ordena as colunas na ordem do treino
-    X = df_internal.reindex(columns=MODEL_FEATURES)
+    # 2) Clippings / features derivadas (iguais ao treino)
+    tempo_chuva = int(np.clip(p["tempo_chuva"], 0, 4))
+    precipitacao_chuva = max(0.0, float(p["precipitacao_chuva"]))
+    precipitacao_acumulada = max(0.0, float(p["precipitacao_acumulada"]))
+    chuva_media_h = precipitacao_acumulada / max(tempo_chuva, 1.0)
 
-    # 5) Predição
-    proba = float(xgb_pipeline.predict_proba(X)[0, 1])  # 0..1
+    slope_plano = 1 if declive_graus < 2 else 0
+    declive_bin = pd.cut(pd.Series([declive_graus]),
+                         bins=DECLIVE_BINS, labels=DECLIVE_LABEL,
+                         include_lowest=True, right=False).astype(str).iloc[0]
+    intensidade_chuva = str(p["intensidade_chuva"]).strip().lower()
+
+    # 3) Monta DataFrame exatamente com as colunas do treino
+    row = {
+        "temperatura": float(p["temperatura"]),
+        "umidade": float(p["umidade"]),
+        "pressao": float(p["pressao"]),
+        "precipitacao_chuva": precipitacao_chuva,
+        "ponto_orvalho": float(p["ponto_orvalho"]),
+        "tempo_chuva": tempo_chuva,
+        "precipitacao_acumulada": precipitacao_acumulada,
+        "solo_elevacao": float(solo_elevacao),
+
+        "chuva_media_h": float(chuva_media_h),
+
+        "declive_graus": float(declive_graus),
+        "slope_plano": int(slope_plano),
+        "declive_bin": declive_bin,
+
+        "intensidade_chuva": intensidade_chuva,
+    }
+    X = pd.DataFrame([row])
+
+    # 4) Predição
+    proba = float(xgb_pipeline.predict_proba(X)[0, 1])
     bucket = bucketize(proba)
 
-    # 6) Formatação: risk (numérico 0..1 com 2 casas) e chance (string pt-BR em %)
-    risk_num = round2(proba)                 # e.g., 0.40
-    chance_pct_str = fmt_ptbr_2dec(proba * 100) + "%"   # e.g., "40,20%"
-
+    # 5) Resposta
     return PredictResponse(
-        risk=risk_num,
-        chance=chance_pct_str,
+        risk=round2(proba),
+        chance=fmt_ptbr_2dec(proba * 100) + "%",
         bucket=bucket,
-        model="xgb"
+        model="xgb",
+        meta={
+            "declive_graus": round(float(declive_graus), 3),
+            "declive_bin": declive_bin,
+            "slope_plano": int(slope_plano),
+            "solo_elevacao_m": round(float(solo_elevacao), 2),
+            "elevacao_google_ok": bool(elev_ok),
+            "slope_tif": os.path.basename(SLOPE_TIF),
+        },
     )
 
 if __name__ == "__main__":
     import uvicorn
-    # Rodar clicando no arquivo (sem reload)
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
