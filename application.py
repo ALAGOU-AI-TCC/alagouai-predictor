@@ -7,6 +7,9 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 import os
 import warnings
+import logging
+import json
+import uuid
 
 import pandas as pd
 import numpy as np
@@ -38,6 +41,35 @@ GOOGLE_MAPS_KEY = "AIzaSyCTOi-ejXpzRg_rNa9zrlFNSxRCIHcqb_8"
 # Bins iguais aos usados no treino
 DECLIVE_BINS  = [0, 2, 4, 6, 8, 10, 15, 60]
 DECLIVE_LABEL = [f"{DECLIVE_BINS[i]}–{DECLIVE_BINS[i+1]}°" for i in range(len(DECLIVE_BINS)-1)]
+
+# =======================
+# Logging
+# =======================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FEATURES = os.getenv("LOG_FEATURES", "1") in ("1", "true", "TRUE", "yes", "YES")
+LOG_PROBA = os.getenv("LOG_PROBA", "1") in ("1", "true", "TRUE", "yes", "YES")
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format='%(message)s'  # log em linha única, ideal para JSON
+)
+logger = logging.getLogger("alagouai")
+
+def jlog(event: str, **kwargs):
+    """Log estruturado (JSON-friendly)."""
+    base = {"event": event}
+    base.update(kwargs)
+    # garantir serialização simples
+    def _conv(o):
+        if isinstance(o, (np.floating, np.integer)):
+            return float(o)
+        if isinstance(o, (pd.Timestamp,)):
+            return o.isoformat()
+        return o
+    try:
+        logger.info(json.dumps(base, default=_conv, ensure_ascii=False))
+    except Exception:
+        logger.info(str(base))
 
 # =======================
 # App
@@ -89,7 +121,8 @@ def sample_raster(ds: rasterio.DatasetReader, lon: float, lat: float) -> Optiona
         if np.isnan(val):
             return None
         return float(val)
-    except Exception:
+    except Exception as e:
+        jlog("slope_sample_error", error=str(e))
         return None
 
 def get_google_elevation(lat: float, lon: float, timeout: float = 3.5) -> Optional[float]:
@@ -104,18 +137,23 @@ def get_google_elevation(lat: float, lon: float, timeout: float = 3.5) -> Option
         params = {"locations": f"{lat},{lon}", "key": GOOGLE_MAPS_KEY}
         r = requests.get(url, params=params, timeout=timeout)
         if r.status_code != 200:
+            jlog("google_elevation_http_error", status_code=r.status_code)
             return None
         data = r.json()
         if data.get("status") != "OK":
+            jlog("google_elevation_api_error", status=data.get("status"))
             return None
         results = data.get("results", [])
         if not results:
+            jlog("google_elevation_empty")
             return None
         elev_m = results[0].get("elevation")
         if elev_m is None:
+            jlog("google_elevation_no_value")
             return None
         return float(elev_m)
-    except Exception:
+    except Exception as e:
+        jlog("google_elevation_exception", error=str(e))
         return None
 
 # =======================
@@ -153,11 +191,13 @@ def health():
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(inp: Input):
+    req_id = str(uuid.uuid4())  # id p/ correlacionar logs da chamada
     p = inp.model_dump(by_alias=False)
 
     # 1) Declive (graus) via raster
     declive_graus = sample_raster(slope_ds, p["longitude"], p["latitude"])
     if declive_graus is None:
+        jlog("predict_error", req_id=req_id, detail="slope_not_found", lat=p["latitude"], lon=p["longitude"])
         raise HTTPException(status_code=422, detail="Declive não encontrado para essa coordenada.")
 
     # 1.1) Elevação via Google (metros) — fallback p/ 0.0 se falhar
@@ -197,9 +237,32 @@ def predict(inp: Input):
     }
     X = pd.DataFrame([row])
 
+    # Log das features enviadas ao modelo (controlável por env)
+    if LOG_FEATURES:
+        jlog(
+            "model_features",
+            req_id=req_id,
+            columns=list(X.columns),
+            row=row,
+            slope_deg=round(float(declive_graus), 3),
+            slope_bin=declive_bin,
+            slope_plano=slope_plano,
+            elev_m=round(float(solo_elevacao), 2),
+            elev_ok=bool(elev_ok),
+            slope_tif=os.path.basename(SLOPE_TIF),
+        )
+
     # 4) Predição
     proba = float(xgb_pipeline.predict_proba(X)[0, 1])
     bucket = bucketize(proba)
+
+    if LOG_PROBA:
+        jlog(
+            "model_output",
+            req_id=req_id,
+            probability=round(proba, 4),
+            bucket=bucket
+        )
 
     # 5) Resposta
     return PredictResponse(
@@ -208,6 +271,7 @@ def predict(inp: Input):
         bucket=bucket,
         model="xgb",
         meta={
+            "req_id": req_id,
             "declive_graus": round(float(declive_graus), 3),
             "declive_bin": declive_bin,
             "slope_plano": int(slope_plano),
@@ -219,4 +283,5 @@ def predict(inp: Input):
 
 if __name__ == "__main__":
     import uvicorn
+    # Se quiser ver logs do uvicorn também, rode com --log-level debug
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
