@@ -1,16 +1,16 @@
 # application.py
+# -*- coding: utf-8 -*-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 import os
+import warnings
 
 import pandas as pd
 import numpy as np
 from joblib import load as joblib_load
-
-import warnings
 from sklearn.exceptions import InconsistentVersionWarning
 
 # HTTP p/ Google Elevation
@@ -31,10 +31,9 @@ MODEL_PATH = os.path.join(MODELS_DIR, "modelo_xgboost.pkl")
 # GeoTIFF de declive em graus; idealmente EPSG:4326
 SLOPE_TIF = os.getenv("SLOPE_TIF", "data/slope_srtm_sp.tif")
 
-# Chave da Google Elevation API (defina no ambiente!)
-GOOGLE_MAPS_KEY = "AIzaSyBpRcVv-m-kQAgoCRlT1HVqNCC1QM0eY1c"
-
-#os.getenv("GOOGLE_MAPS_KEY")
+# Chave da Google Elevation API (defina no ambiente, se possível)
+GOOGLE_MAPS_KEY = "AIzaSyCTOi-ejXpzRg_rNa9zrlFNSxRCIHcqb_8"
+# GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY")
 
 # Bins iguais aos usados no treino
 DECLIVE_BINS  = [0, 2, 4, 6, 8, 10, 15, 60]
@@ -166,11 +165,10 @@ def predict(inp: Input):
     elev_ok = elev is not None
     solo_elevacao = elev if elev_ok else 0.0
 
-    # 2) Clippings / features derivadas (iguais ao treino)
+    # 2) Clippings / features derivadas (iguais ao treino; sem chuva_media_h)
     tempo_chuva = int(np.clip(p["tempo_chuva"], 0, 4))
     precipitacao_chuva = max(0.0, float(p["precipitacao_chuva"]))
     precipitacao_acumulada = max(0.0, float(p["precipitacao_acumulada"]))
-    chuva_media_h = precipitacao_acumulada / max(tempo_chuva, 1.0)
 
     slope_plano = 1 if declive_graus < 2 else 0
     declive_bin = pd.cut(pd.Series([declive_graus]),
@@ -189,7 +187,7 @@ def predict(inp: Input):
         "precipitacao_acumulada": precipitacao_acumulada,
         "solo_elevacao": float(solo_elevacao),
 
-        "chuva_media_h": float(chuva_media_h),
+        # REMOVIDO: "chuva_media_h"
 
         "declive_graus": float(declive_graus),
         "slope_plano": int(slope_plano),
